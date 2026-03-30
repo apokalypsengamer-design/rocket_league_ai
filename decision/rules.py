@@ -1,6 +1,8 @@
+from __future__ import annotations
 from config import Config
-from core.state import GameState
+from core.state import GameState, ObjectPosition
 from input.actions import Action
+from utils.math_utils import distance
 
 
 class RuleEngine:
@@ -18,29 +20,38 @@ class RuleEngine:
         return self._rotate(state)
 
     def _attack(self, state: GameState) -> Action:
-        return self._steer_to_ball(Action(forward=True, boost=True), state)
+        target = self._ball_pos(state) if state.ball_visible else state.enemy_goal
+        a = Action(forward=True, boost=True)
+        return self._steer_to(a, state.player_x, target)
 
     def _defense(self, state: GameState) -> Action:
         a = Action(forward=True, boost=True)
-        a.steer_left  = state.ball_x < (0.5 - self._dz)
-        a.steer_right = state.ball_x > (0.5 + self._dz)
-        return a
+        target = self._ball_pos(state) if state.ball_visible else state.own_goal
+        return self._steer_to(a, state.player_x, target)
 
     def _rotate(self, state: GameState) -> Action:
-        return self._steer_to_ball(Action(forward=True), state)
+        if state.ball_visible:
+            a = Action(forward=True)
+            return self._steer_to(a, state.player_x, self._ball_pos(state))
+        return Action(forward=True)
 
     def _boost_collect(self, state: GameState) -> Action:
         a = Action(forward=True)
+        pad = state.nearest_boost
+        if pad and pad.visible:
+            return self._steer_to(a, state.player_x, pad)
         if state.ball_visible:
-            a.steer_left  = state.ball_x < (0.5 - self._dz)
-            a.steer_right = state.ball_x > (0.5 + self._dz)
-        else:
-            a.steer_right = True
+            return self._steer_to(a, state.player_x, self._ball_pos(state))
         return a
 
-    def _steer_to_ball(self, action: Action, state: GameState) -> Action:
-        if not state.ball_visible:
+    def _steer_to(self, action: Action, player_x: float, target: ObjectPosition) -> Action:
+        if not target or not target.visible:
             return action
-        action.steer_left  = state.ball_x < (0.5 - self._dz)
-        action.steer_right = state.ball_x > (0.5 + self._dz)
+        diff = target.x - player_x
+        action.steer_left  = diff < -self._dz
+        action.steer_right = diff >  self._dz
         return action
+
+    @staticmethod
+    def _ball_pos(state: GameState) -> ObjectPosition:
+        return ObjectPosition(state.ball_x, state.ball_y, state.ball_visible)
