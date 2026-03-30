@@ -8,44 +8,51 @@ try:
 except ImportError:
     _PYNPUT = False
 
-_BUTTON_MAP = {"right": Button.right, "left": Button.left, "middle": Button.middle}
+_BUTTON_MAP = {"right": Button.right, "left": Button.left, "middle": Button.middle} if _PYNPUT else {}
+_SPECIAL_KEY_MAP = {"shift_l": Key.shift_l, "shift_r": Key.shift_r,
+                    "ctrl_l": Key.ctrl_l,   "ctrl_r": Key.ctrl_r,
+                    "alt_l": Key.alt_l,     "space": Key.space} if _PYNPUT else {}
+
+
+def _resolve_key(raw: str):
+    return _SPECIAL_KEY_MAP.get(raw, raw)
+
 
 class Controller:
     def __init__(self, config: Config):
-        self.config = config
-        self._kb     = KB()    if _PYNPUT else None
-        self._mouse  = Mouse() if _PYNPUT else None
-        self._keys: set   = set()
-        self._btns: set   = set()
+        self._key_cfg  = config.keys
+        self._kb       = KB()    if _PYNPUT else None
+        self._mouse    = Mouse() if _PYNPUT else None
+        self._keys:  set = set()
+        self._btns:  set = set()
 
         if not _PYNPUT:
             print("[Controller] pynput fehlt – Inputs werden nur geloggt.  pip install pynput")
 
     def execute(self, action: Action):
-        want_keys = self._resolve_keys(action)
-        want_btns = self._resolve_buttons(action)
-        self._sync_keys(want_keys)
-        self._sync_btns(want_btns)
+        self._sync_keys(self._resolve_keys(action))
+        self._sync_btns(self._resolve_buttons(action))
 
     def release_all(self):
         for k in list(self._keys):
             self._up(k)
         for b in list(self._btns):
             self._btn_up(b)
+        self._keys.clear()
+        self._btns.clear()
 
     def _resolve_keys(self, action: Action) -> set:
         keys = set()
-        for field, key in self.config.keys.items():
-            if getattr(action, field, False):
-                keys.add(key)
+        for field_name, raw_key in self._key_cfg.as_dict().items():
+            if getattr(action, field_name, False):
+                keys.add(_resolve_key(raw_key))
         return keys
 
     def _resolve_buttons(self, action: Action) -> set:
-        btns = set()
-        for field, btn_name in self.config.mouse_buttons.items():
-            if getattr(action, field, False):
-                btns.add(_BUTTON_MAP.get(btn_name))
-        return {b for b in btns if b is not None}
+        if getattr(action, "boost", False):
+            btn = _BUTTON_MAP.get(self._key_cfg.boost_mouse_button)
+            return {btn} if btn else set()
+        return set()
 
     def _sync_keys(self, want: set):
         for k in want - self._keys:
