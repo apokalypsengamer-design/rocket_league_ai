@@ -7,6 +7,7 @@ from vision.preprocessing import preprocess
 from vision.detection import Detector
 from decision.brain import Brain
 from input.controller import Controller
+from learning.trainer import Trainer
 from utils.timing import FrameTimer
 
 log = setup_logger("game_loop")
@@ -14,17 +15,18 @@ log = setup_logger("game_loop")
 
 class GameLoop:
     def __init__(self, config: Config):
-        self.config = config
+        self.config     = config
         self.capture    = ScreenCapture(config)
         self.detector   = Detector(config)
         self.brain      = Brain(config)
         self.controller = Controller(config)
+        self.trainer    = Trainer()
         self.timer      = FrameTimer(config.capture.fps)
         self.running    = False
 
     def run(self):
         self.running = True
-        log.info(f"Loop gestartet @ {self.config.capture.fps} FPS")
+        log.info(f"Loop gestartet @ {self.config.capture.fps} FPS  |  dummy_mode={self.config.vision.dummy_mode}")
         while self.running:
             start = time.perf_counter()
 
@@ -33,10 +35,12 @@ class GameLoop:
             state     = self.detector.detect(processed, frame)
             action    = self.brain.decide(state)
             self.controller.execute(action)
+            self.trainer.record(state, action)
 
             self.timer.tick(start)
 
     def stop(self):
         self.running = False
         self.controller.release_all()
+        self.trainer.reset_episode()
         log.info("Loop gestoppt, alle Inputs freigegeben")
