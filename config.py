@@ -31,12 +31,34 @@ class KeyConfig:
 class VisionConfig:
     target_width:   int = 640
     target_height:  int = 360
+
     ball_hsv_lower: list = field(default_factory=lambda: [5, 100, 100])
     ball_hsv_upper: list = field(default_factory=lambda: [25, 255, 255])
-    ball_min_area:  int = 50
-    boost_roi: tuple = (0.70, 0.92, 0.25, 0.08)
-    boost_brightness_threshold: int = 180
-    boost_scale_factor: float = 4.0
+    ball_min_area:  int  = 50
+
+    goal_own_hsv_lower:   list = field(default_factory=lambda: [100, 80, 80])
+    goal_own_hsv_upper:   list = field(default_factory=lambda: [130, 255, 255])
+    goal_enemy_hsv_lower: list = field(default_factory=lambda: [0, 80, 80])
+    goal_enemy_hsv_upper: list = field(default_factory=lambda: [10, 255, 255])
+    goal_min_area: int = 200
+
+    boost_pad_hsv_lower: list = field(default_factory=lambda: [20, 100, 150])
+    boost_pad_hsv_upper: list = field(default_factory=lambda: [35, 255, 255])
+    boost_pad_min_area:  int  = 30
+    max_boost_pads:      int  = 6
+
+    enemy_hsv_lower:   list = field(default_factory=lambda: [140, 80, 80])
+    enemy_hsv_upper:   list = field(default_factory=lambda: [170, 255, 255])
+    teammate_hsv_lower: list = field(default_factory=lambda: [35, 80, 80])
+    teammate_hsv_upper: list = field(default_factory=lambda: [85, 255, 255])
+    agent_min_area: int = 30
+    max_agents: int = 3
+
+    boost_roi:                  tuple = (0.70, 0.92, 0.25, 0.08)
+    boost_brightness_threshold: int   = 180
+    boost_scale_factor:         float = 4.0
+
+    dummy_mode: bool = True
 
 
 @dataclass
