@@ -1,6 +1,6 @@
+from __future__ import annotations
 import time
 from config import Config
-from core.state import GameState
 from core.logger import setup_logger
 from vision.screen_capture import ScreenCapture
 from vision.preprocessing import preprocess
@@ -24,11 +24,22 @@ class GameLoop:
         self.timer      = FrameTimer(config.capture.fps)
         self.running    = False
 
-    def run(self):
+    def run(self) -> None:
         self.running = True
-        log.info(f"Loop gestartet @ {self.config.capture.fps} FPS  |  dummy_mode={self.config.vision.dummy_mode}")
+        log.info(
+            f"Loop gestartet | FPS={self.config.capture.fps} "
+            f"dummy_mode={self.config.vision.dummy_mode}"
+        )
+        print(
+            f"\n{'─'*180}\n"
+            f"{'Frame':>7} | {'Ball':^20} | {'Gegner/Teammates':^22} | "
+            f"{'Pads':^6} | {'Boost':^7} | {'Phase':^15} | "
+            f"{'Action':<30} | Grund\n"
+            f"{'─'*180}"
+        )
+
         while self.running:
-            start = time.perf_counter()
+            t0 = time.perf_counter()
 
             frame     = self.capture.grab()
             processed = preprocess(frame, self.config.vision)
@@ -37,10 +48,10 @@ class GameLoop:
             self.controller.execute(action)
             self.trainer.record(state, action)
 
-            self.timer.tick(start)
+            self.timer.tick(t0)
 
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
         self.controller.release_all()
         self.trainer.reset_episode()
-        log.info("Loop gestoppt, alle Inputs freigegeben")
+        log.info("Loop gestoppt.")
