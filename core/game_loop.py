@@ -1,7 +1,7 @@
 from __future__ import annotations
 import time
 from config import Config
-from core.logger import setup_logger
+from core.logger import setup_logger, print_header
 from vision.screen_capture import ScreenCapture
 from vision.preprocessing import preprocess
 from vision.detection import Detector
@@ -14,6 +14,10 @@ log = setup_logger("game_loop")
 
 
 class GameLoop:
+    """
+    Main loop:  grab frame → detect state → decide action → send inputs → record.
+    """
+
     def __init__(self, config: Config):
         self.config     = config
         self.capture    = ScreenCapture(config)
@@ -27,16 +31,12 @@ class GameLoop:
     def run(self) -> None:
         self.running = True
         log.info(
-            f"Loop gestartet | FPS={self.config.capture.fps} "
-            f"dummy_mode={self.config.vision.dummy_mode}"
+            f"Game-Loop gestartet | "
+            f"FPS={self.config.capture.fps} | "
+            f"dummy_mode={self.config.vision.dummy_mode} | "
+            f"pynput_keys={list(Controller(self.config)._kb_map.keys())}"
         )
-        print(
-            f"\n{'─'*180}\n"
-            f"{'Frame':>7} | {'Ball':^20} | {'Gegner/Teammates':^22} | "
-            f"{'Pads':^6} | {'Boost':^7} | {'Phase':^15} | "
-            f"{'Action':<30} | Grund\n"
-            f"{'─'*180}"
-        )
+        print_header()
 
         while self.running:
             t0 = time.perf_counter()
@@ -54,4 +54,4 @@ class GameLoop:
         self.running = False
         self.controller.release_all()
         self.trainer.reset_episode()
-        log.info("Loop gestoppt.")
+        log.info("Game-Loop gestoppt.")
