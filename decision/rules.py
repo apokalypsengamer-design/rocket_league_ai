@@ -2,49 +2,65 @@ from __future__ import annotations
 from config import Config
 from core.state import GameState, ObjectPosition
 from input.actions import Action
-from utils.math_utils import distance
 
 
 class RuleEngine:
+    """
+    Pure rule-based decision engine.  No state, no history — each call
+    receives a GameState and returns a fresh Action.
+
+    Rules (priority order):
+      1. boost_collect  → drive toward nearest boost pad
+      2. defense        → drive toward ball (to intercept) with boost
+      3. attack         → drive toward ball with boost
+      4. rotate         → drive toward ball without boost (conserve)
+    """
+
     def __init__(self, config: Config):
         self._dz = config.gameplay.steer_dead_zone
 
     def evaluate(self, state: GameState, frame: int) -> Action:
-        phase = state.phase
-        if phase == "attack":
+        if state.phase == "attack":
             return self._attack(state)
-        if phase == "defense":
+        if state.phase == "defense":
             return self._defense(state)
-        if phase == "boost_collect":
+        if state.phase == "boost_collect":
             return self._boost_collect(state)
         return self._rotate(state)
 
+    # ── Phase handlers ────────────────────────────────────────────────────────
+
     def _attack(self, state: GameState) -> Action:
-        target = self._ball_pos(state) if state.ball_visible else state.enemy_goal
-        a = Action(forward=True, boost=True)
-        return self._steer_to(a, state.player_x, target)
+        """Drive toward ball with boost.  If ball invisible, aim at enemy goal."""
+        target = self._ball_as_obj(state) if state.ball_visible else state.enemy_goal
+        return self._steer_to(Action(forward=True, boost=True), state.player_x, target)
 
     def _defense(self, state: GameState) -> Action:
-        a = Action(forward=True, boost=True)
-        target = self._ball_pos(state) if state.ball_visible else state.own_goal
-        return self._steer_to(a, state.player_x, target)
+        """Rush back toward ball / own goal with boost."""
+        target = self._ball_as_obj(state) if state.ball_visible else state.own_goal
+        return self._steer_to(Action(forward=True, boost=True), state.player_x, target)
 
     def _rotate(self, state: GameState) -> Action:
+        """Drive forward toward ball without wasting boost."""
         if state.ball_visible:
-            a = Action(forward=True)
-            return self._steer_to(a, state.player_x, self._ball_pos(state))
+            return self._steer_to(Action(forward=True), state.player_x, self._ball_as_obj(state))
         return Action(forward=True)
 
     def _boost_collect(self, state: GameState) -> Action:
+        """Navigate toward nearest visible boost pad; fall back to ball direction."""
         a = Action(forward=True)
         pad = state.nearest_boost
         if pad and pad.visible:
             return self._steer_to(a, state.player_x, pad)
         if state.ball_visible:
-            return self._steer_to(a, state.player_x, self._ball_pos(state))
+            return self._steer_to(a, state.player_x, self._ball_as_obj(state))
         return a
 
+    # ── Steering helper ───────────────────────────────────────────────────────
+
     def _steer_to(self, action: Action, player_x: float, target: ObjectPosition) -> Action:
+        """Set steer_left / steer_right based on horizontal offset to target.
+        Uses a dead-zone to avoid jitter when the target is centred."""
         if not target or not target.visible:
             return action
         diff = target.x - player_x
@@ -53,5 +69,5 @@ class RuleEngine:
         return action
 
     @staticmethod
-    def _ball_pos(state: GameState) -> ObjectPosition:
+    def _ball_as_obj(state: GameState) -> ObjectPosition:
         return ObjectPosition(state.ball_x, state.ball_y, state.ball_visible)
