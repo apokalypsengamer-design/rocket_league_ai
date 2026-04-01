@@ -1,6 +1,6 @@
 from __future__ import annotations
 from config import Config
-from core.state import GameState
+from core.state import GameState, ObjectPosition
 from input.actions import Action
 from decision.rules import RuleEngine
 from decision.strategy import Strategy
@@ -8,66 +8,94 @@ from core.logger import setup_logger
 
 log = setup_logger("brain")
 
-_PHASE_LABELS = {
-    "attack":        "⚽ Angriff",
-    "defense":       "🛡  Verteidigung",
-    "boost_collect": "⚡ Boost sammeln",
-    "rotate":        "🔄 Rotation",
-    "unknown":       "❓ Unbekannt",
+_PHASE_ICON = {
+    "attack":        "ANGRIFF",
+    "defense":       "VERTEIDIGUNG",
+    "boost_collect": "BOOST SAMMELN",
+    "rotate":        "ROTATION",
+    "unknown":       "UNBEKANNT",
 }
 
 
 class Brain:
     def __init__(self, config: Config):
-        self._config   = config
-        self.rules     = RuleEngine(config)
-        self.strategy  = Strategy(config)
-        self._frame    = 0
-        self._last_log = ""
+        self._config  = config
+        self.rules    = RuleEngine(config)
+        self.strategy = Strategy(config)
+        self._frame   = 0
 
     def decide(self, state: GameState) -> Action:
         self._frame += 1
-        state.phase = self.strategy.refine_phase(state, self._frame)
-        action = self.rules.evaluate(state, self._frame)
-        state.reasoning = self._build_reasoning(state, action)
-        self._console_feedback(state, action)
+        state.phase     = self.strategy.refine_phase(state, self._frame)
+        action          = self.rules.evaluate(state, self._frame)
+        state.reasoning = self._build_reasoning(state)
+        self._print_feedback(state, action)
         return action
 
-    def _build_reasoning(self, state: GameState, action: Action) -> str:
-        phase = state.phase
-        if phase == "attack":
-            return f"Ball {state.ball_side} → fahre mit Boost zum Ball"
-        if phase == "defense":
-            enemy = state.nearest_enemy
-            enemy_str = f"Gegner {enemy.side()}" if enemy else "kein Gegner sichtbar"
-            return f"Ball in eigener Hälfte ({state.ball_side}), {enemy_str} → zurück zum Tor"
-        if phase == "boost_collect":
-            pad = state.nearest_boost
-            pad_str = f"nächstes Pad bei ({pad.x:.2f},{pad.y:.2f})" if pad else "kein Pad sichtbar"
-            return f"Boost niedrig ({state.boost:.0f}%) → {pad_str}"
-        return f"Ball {state.ball_side} → Positionierung"
+    # ── Reasoning string ────────────────────────────────────────────────────
 
-    def _console_feedback(self, state: GameState, action: Action) -> None:
-        if self._frame % 10 != 1:
-            return
+    def _build_reasoning(self, state: GameState) -> str:
+        p = state.phase
+        if p == "attack":
+            target = f"Ball {state.ball_side}"
+            if state.ball_visible:
+                target += f" @ ({state.ball_x:.2f},{state.ball_y:.2f})"
+            return f"{target} → Boost + Fahren zum Ball"
 
-        keys     = ", ".join(action.active_keys()) or "IDLE"
-        phase    = _PHASE_LABELS.get(state.phase, state.phase)
-        boost    = f"{state.boost:.0f}%" if state.boost >= 0 else "?"
-        enemy    = state.nearest_enemy
-        enemy_str = f"Gegner {enemy.side()}" if enemy else "kein Gegner"
+        if p == "defense":
+            en    = state.nearest_enemy
+            e_str = f"Gegner {en.side()} @ ({en.x:.2f},{en.y:.2f})" if en else "kein Gegner sichtbar"
+            return (
+                f"Ball {state.ball_side} in eigener Hälfte | {e_str} "
+                f"→ Rückkehr zum Tor"
+            )
 
-        lines = [
-            f"┌─ Frame {self._frame:>6} ──────────────────────────────",
-            f"│  Aktion   : {keys}",
-            f"│  Ziel     : Ball {state.ball_side}, {enemy_str}",
-            f"│  Strategie: {state.reasoning}",
-            f"│  Phase    : {phase}  │  Boost: {boost}  │  Ball sichtbar: {state.ball_visible}",
-            f"└────────────────────────────────────────────────────",
-        ]
-        output = "\n".join(lines)
+        if p == "boost_collect":
+            pad   = state.nearest_boost
+            p_str = f"Pad @ ({pad.x:.2f},{pad.y:.2f})" if pad else "kein Pad sichtbar"
+            boost = f"{state.boost:.0f}%" if state.boost >= 0 else "?"
+            return f"Boost niedrig ({boost}) | nächstes {p_str} → Boost aufnehmen"
 
-        if output != self._last_log:
-            print(output)
-            log.debug(f"Frame={self._frame} Action={keys} Phase={state.phase} Boost={boost}")
-            self._last_log = output
+        ball_str = (
+            f"Ball {state.ball_side} @ ({state.ball_x:.2f},{state.ball_y:.2f})"
+            if state.ball_visible else "Ball nicht sichtbar"
+        )
+        return f"{ball_str} → Positionierung"
+
+    # ── Console output (every frame, compact single line) ───────────────────
+
+    def _print_feedback(self, state: GameState, action: Action) -> None:
+        keys      = "+".join(action.active_keys()) or "IDLE"
+        boost_str = f"{state.boost:.0f}%" if state.boost >= 0 else "?"
+        phase_str = _PHASE_ICON.get(state.phase, state.phase)
+
+        ball_str  = (
+            f"({state.ball_x:.2f},{state.ball_y:.2f})"
+            if state.ball_visible else "nicht sichtbar"
+        )
+
+        enemies_str   = (
+            f"{len(state.enemies)} Gegner"
+            if state.enemies else "keine Gegner"
+        )
+        teammates_str = (
+            f"{len(state.teammates)} Teammates"
+            if state.teammates else "keine Teammates"
+        )
+        pads_str      = f"{len(state.boost_pads)} Pads"
+
+        print(
+            f"Frame {self._frame:>5} | "
+            f"Ball {ball_str} | "
+            f"{enemies_str} | {teammates_str} | {pads_str} | "
+            f"Boost {boost_str} | "
+            f"Phase: {phase_str:>15} | "
+            f"Action: {keys:<30} | "
+            f"Grund: {state.reasoning}"
+        )
+
+        log.debug(
+            f"frame={self._frame} phase={state.phase} "
+            f"action={keys} boost={boost_str} "
+            f"ball_visible={state.ball_visible}"
+        )
