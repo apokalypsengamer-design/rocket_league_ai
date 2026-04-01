@@ -1,18 +1,38 @@
-import math
+import time
 
-def distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+class FrameTimer:
+    def __init__(self, target_fps: int = 30):
+        self.target_fps = target_fps
+        self._frame_time = 1.0 / target_fps
+        self._last = time.perf_counter()
+        self.actual_fps = 0.0
+        self._count = 0
+        self._window_start = time.perf_counter()
 
-def normalize(value: float, min_val: float, max_val: float) -> float:
-    if max_val == min_val:
-        return 0.0
-    return (value - min_val) / (max_val - min_val)
+    def tick(self, frame_start: float):
+        elapsed = time.perf_counter() - frame_start
+        sleep = self._frame_time - elapsed
+        if sleep > 0:
+            time.sleep(sleep)
 
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+        self._count += 1
+        now = time.perf_counter()
+        if now - self._window_start >= 1.0:
+            self.actual_fps = self._count / (now - self._window_start)
+            self._count = 0
+            self._window_start = now
 
-def angle_to(x1: float, y1: float, x2: float, y2: float) -> float:
-    return math.degrees(math.atan2(y2 - y1, x2 - x1))
+class Stopwatch:
+    def __init__(self):
+        self._start: float | None = None
 
-def lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * clamp(t, 0.0, 1.0)
+    def start(self):
+        self._start = time.perf_counter()
+
+    def elapsed(self) -> float:
+        if self._start is None:
+            return 0.0
+        return time.perf_counter() - self._start
+
+    def reset(self):
+        self._start = None
