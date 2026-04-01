@@ -6,19 +6,10 @@ from core.state import GameState
 
 class Strategy:
     """
-    Applies hysteresis to the raw phase from the Detector so the Bot
-    does not flicker between phases on every frame.
+    Wendet Hysterese auf die rohe Phase vom Detector an, damit der Bot
+    nicht frame-für-frame zwischen Phasen wechselt.
 
-    Fix vs. previous version
-    ─────────────────────────
-    The old code had a logic error: it set _phase_counter = 1 inside the
-    `else` branch and *immediately* checked whether that counter reached
-    the hysteresis threshold — which it never could (1 < 8).  The counter
-    therefore never committed a new phase.
-
-    New logic: track how many *consecutive* frames the raw phase differs
-    from the committed phase.  Only switch when that streak reaches the
-    threshold.
+    Neu: reset_pending() für externe Overrides (z.B. Schuss-Phase).
     """
 
     def __init__(self, config: Config):
@@ -33,14 +24,12 @@ class Strategy:
         self._history.append(raw)
 
         if raw == self._committed_phase:
-            # Already in committed phase — reset pending streak.
             self._pending_phase = raw
             self._pending_count = 0
         else:
             if raw == self._pending_phase:
                 self._pending_count += 1
             else:
-                # New candidate phase — start fresh streak.
                 self._pending_phase = raw
                 self._pending_count = 1
 
@@ -49,6 +38,15 @@ class Strategy:
                 self._pending_count   = 0
 
         return self._committed_phase
+
+    def reset_pending(self) -> None:
+        """
+        Setzt den pending-Counter zurück, ohne die committed phase zu ändern.
+        Wird aufgerufen wenn ein externer Override (z.B. Schuss) aktiv ist,
+        damit die Hysterese nicht durch die Override-Frames korrumpiert wird.
+        """
+        self._pending_count = 0
+        self._pending_phase = self._committed_phase
 
     def dominant_phase(self) -> str:
         if not self._history:
