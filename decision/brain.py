@@ -9,7 +9,6 @@ from core.logger import setup_logger
 
 log = setup_logger("brain")
 
-# ── Phase labels ─────────────────────────────────────────────────────────────
 _PHASE_LABEL: dict[str, str] = {
     "attack":        "ANGRIFF      ",
     "defense":       "VERTEIDIGUNG ",
@@ -18,17 +17,17 @@ _PHASE_LABEL: dict[str, str] = {
     "unknown":       "UNBEKANNT    ",
 }
 
-# How often (in seconds) the live status line is printed to stdout.
-# Set to 0 to print every frame (flood mode).
 _PRINT_INTERVAL: float = 0.25
 
 
 class Brain:
     """
-    Orchestrates strategy + rules and emits a readable live debug line.
+    Orchestriert Strategy + Rules und gibt lesbaren Debug-Output aus.
 
-    Console output format (one line per interval):
-        Frame  042 | Ball (0.65,0.35) rechts | Boost  75% | ANGRIFF       | forward+boost+steer_right | Ball rechts → Boost + Fahren zum Ball
+    Änderung gegenüber Vorversion:
+    - rules.evaluate() gibt jetzt (Action, reason) zurück
+    - Shot-Opportunity wird in der Ausgabe angezeigt
+    - Phase 'shot' wird als Override behandelt (unabhängig von Strategy)
     """
 
     def __init__(self, config: Config):
@@ -38,42 +37,22 @@ class Brain:
         self._frame      = 0
         self._last_print = 0.0
 
-    # ── Main entry ────────────────────────────────────────────────────────────
-
     def decide(self, state: GameState) -> Action:
-        self._frame    += 1
-        state.phase     = self.strategy.refine_phase(state, self._frame)
-        action          = self.rules.evaluate(state, self._frame)
-        state.reasoning = self._build_reasoning(state)
+        self._frame += 1
+
+        # Shot-Opportunity überschreibt immer die Strategy
+        if state.shot_opportunity:
+            state.phase = "shot"
+            self.strategy.reset_pending()   # Hysterese nicht durch Schuss korrumpieren
+        else:
+            state.phase = self.strategy.refine_phase(state, self._frame)
+
+        # Entscheidung + Begründung
+        action, reasoning = self.rules.evaluate(state, self._frame)
+        state.reasoning   = reasoning
+
         self._maybe_print(state, action)
         return action
-
-    # ── Reasoning ─────────────────────────────────────────────────────────────
-
-    def _build_reasoning(self, state: GameState) -> str:
-        p = state.phase
-
-        if p == "attack":
-            if state.ball_visible:
-                return f"Ball {state.ball_side} @ ({state.ball_x:.2f},{state.ball_y:.2f}) → Boost + Fahren zum Ball"
-            return "Ball unsichtbar → fahre vorwärts zum gegnerischen Tor"
-
-        if p == "defense":
-            en = state.nearest_enemy
-            e_str = f"Gegner {en.side()} @ ({en.x:.2f},{en.y:.2f})" if en else "kein Gegner sichtbar"
-            return f"Ball {state.ball_side} in eigener Hälfte | {e_str} → zurück zum Tor"
-
-        if p == "boost_collect":
-            pad   = state.nearest_boost
-            p_str = f"Pad @ ({pad.x:.2f},{pad.y:.2f})" if pad else "kein Pad"
-            boost = f"{state.boost:.0f}%" if state.boost >= 0 else "?"
-            return f"Boost niedrig ({boost}) → {p_str}"
-
-        if state.ball_visible:
-            return f"Ball {state.ball_side} @ ({state.ball_x:.2f},{state.ball_y:.2f}) → Positionierung"
-        return "Ball nicht sichtbar → vorwärts"
-
-    # ── Live console output ───────────────────────────────────────────────────
 
     def _maybe_print(self, state: GameState, action: Action) -> None:
         now = time.monotonic()
@@ -85,24 +64,31 @@ class Brain:
     def _print_line(self, state: GameState, action: Action) -> None:
         keys      = "+".join(action.active_keys()) or "IDLE"
         boost_str = f"{state.boost:5.0f}%" if state.boost >= 0 else "    ?"
-        phase_str = _PHASE_LABEL.get(state.phase, state.phase)
+
+        if state.phase == "shot":
+            phase_str = "*** SCHUSS ***"
+        else:
+            phase_str = _PHASE_LABEL.get(state.phase, state.phase)
 
         if state.ball_visible:
             ball_str = f"({state.ball_x:.2f},{state.ball_y:.2f}) {state.ball_side:<6}"
         else:
             ball_str = "nicht sichtbar      "
 
+        shot_flag = " [SHOOT]" if state.shot_opportunity else ""
+
         line = (
             f"Frame {self._frame:>5} | "
-            f"Ball {ball_str} | "
+            f"Ball {ball_str}{shot_flag} | "
             f"Boost {boost_str} | "
-            f"{phase_str} | "
+            f"{phase_str:<15} | "
             f"{keys:<35} | "
             f"{state.reasoning}"
         )
         print(line)
         log.debug(
             f"frame={self._frame} phase={state.phase} "
-            f"action={keys} boost={boost_str.strip()} "
+            f"shot={state.shot_opportunity} action={keys} "
+            f"boost={boost_str.strip()} "
             f"ball=({state.ball_x:.2f},{state.ball_y:.2f}) visible={state.ball_visible}"
         )
