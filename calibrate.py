@@ -11,6 +11,11 @@ Anleitung:
        3 = Eigenes Tor    4 = Gegnerisches Tor
        5 = Gegner-Auto    r = Reset aktueller Modus
        s = Speichern      q = Beenden + config.py Werte ausgeben
+
+Neu in dieser Version:
+  - Live-Vorschau zeigt Spielfeld-ROI (grauer Rahmen)
+  - Objekte außerhalb des ROI werden vom Bot ignoriert
+  - ROI-Grenzen lassen sich mit W/A/S/D feinjustieren
 """
 
 import sys
@@ -36,8 +41,8 @@ if not _MSS and not _PIL:
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 
-SAMPLE_RADIUS = 8      # Pixel-Radius um Klickpunkt
-HSV_MARGIN    = [8, 40, 40]   # [H, S, V] Spielraum um berechneten Bereich
+SAMPLE_RADIUS = 8
+HSV_MARGIN    = [8, 40, 40]   # [H, S, V]
 
 MODES = {
     ord("1"): "Ball",
@@ -63,6 +68,10 @@ CONFIG_KEYS = {
     "Gegner-Auto":      ("enemy_hsv_lower",      "enemy_hsv_upper"),
 }
 
+# ROI-Startwerte (Anteil des Bildes, 0.0–1.0)
+roi = {"top": 0.15, "bottom": 0.92, "left": 0.05, "right": 0.95}
+ROI_STEP = 0.01   # Schrittweite bei W/A/S/D
+
 # ── Globaler State ────────────────────────────────────────────────────────────
 
 current_mode = "Ball"
@@ -70,7 +79,7 @@ samples: dict[str, list] = defaultdict(list)
 ranges:  dict[str, tuple] = {}
 last_frame: np.ndarray | None = None
 DISPLAY_W, DISPLAY_H = 1280, 760
-UI_TOP = 90   # Höhe des oberen UI-Streifens in Pixeln
+UI_TOP = 90
 
 
 def grab_frame() -> np.ndarray:
@@ -115,6 +124,15 @@ def draw_mask_overlay(frame_bgr: np.ndarray, lo: list, hi: list,
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # ROI-Maske anwenden (zeigt was der Bot auch sieht)
+    h, w = mask.shape[:2]
+    roi_mask = np.zeros((h, w), dtype=np.uint8)
+    y1 = int(h * roi["top"]);    y2 = int(h * roi["bottom"])
+    x1 = int(w * roi["left"]);   x2 = int(w * roi["right"])
+    roi_mask[y1:y2, x1:x2] = 255
+    mask = cv2.bitwise_and(mask, roi_mask)
+
     result = frame_bgr.copy()
     hl     = np.zeros_like(frame_bgr)
     hl[mask > 0] = color_bgr
@@ -132,20 +150,37 @@ def draw_mask_overlay(frame_bgr: np.ndarray, lo: list, hi: list,
     return result
 
 
+def draw_roi_overlay(frame: np.ndarray) -> np.ndarray:
+    """Zeichnet den aktiven ROI-Rahmen auf das (bereits skalierte) Bild."""
+    h, w = frame.shape[:2]
+    x1 = int(w * roi["left"])
+    x2 = int(w * roi["right"])
+    y1 = int(h * roi["top"])
+    y2 = int(h * roi["bottom"])
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 200, 80), 1)
+    cv2.putText(frame, "Bot-Suchbereich (ROI)",
+                (x1 + 4, y1 + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 200, 80), 1)
+    return frame
+
+
 def draw_ui(frame: np.ndarray, click_marks: list) -> np.ndarray:
     h, w = frame.shape[:2]
-    # Oberer Streifen
     cv2.rectangle(frame, (0, 0), (w, UI_TOP), (20, 20, 20), -1)
     col = MODE_COLORS_BGR.get(current_mode, (255, 255, 255))
     cv2.putText(frame, f"Modus: {current_mode}  — Klicke auf das Objekt",
                 (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, col, 2)
     cv2.putText(frame,
-                "1=Ball  2=Boostpad  3=EigenTor  4=GegnerTor  5=GegnerAuto  "
+                "1=Ball  2=Boost  3=EigenTor  4=GegnerTor  5=GegnerAuto  "
                 "r=Reset  q=Beenden",
-                (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                (10, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 180, 180), 1)
     cv2.putText(frame,
-                "Mehrmals klicken = genauer  |  Erkannte Bereiche leuchten farbig auf",
-                (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (130, 130, 130), 1)
+                "ROI anpassen: W=oben hoch  S=oben runter  A=links  D=rechts  "
+                "I=unten hoch  K=unten runter",
+                (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (100, 180, 100), 1)
+    cv2.putText(frame,
+                "Mehrmals klicken = genauer  |  Grüner Rahmen = Bot-Suchbereich",
+                (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (100, 100, 100), 1)
 
     # Rechtes Panel
     px = w - 300
@@ -167,7 +202,6 @@ def draw_ui(frame: np.ndarray, click_marks: list) -> np.ndarray:
             cv2.putText(frame, f"[ ] {name}  {lbl}", (px, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.47, (100, 100, 100), 1)
 
-    # Aktueller Bereich
     if current_mode in ranges:
         lo, hi = ranges[current_mode]
         y += 28
@@ -181,7 +215,17 @@ def draw_ui(frame: np.ndarray, click_marks: list) -> np.ndarray:
         cv2.putText(frame, f"{n_clicks} Pixel gesammelt", (px, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
 
-    # Klick-Markierungen
+    # ROI-Werte anzeigen
+    y += 32
+    cv2.putText(frame, "ROI:", (px, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.47, (80, 200, 80), 1)
+    y += 18
+    cv2.putText(frame, f"  top={roi['top']:.2f}  bot={roi['bottom']:.2f}", (px, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 200, 80), 1)
+    y += 16
+    cv2.putText(frame, f"  left={roi['left']:.2f}  right={roi['right']:.2f}", (px, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 200, 80), 1)
+
     col = MODE_COLORS_BGR.get(current_mode, (255, 255, 255))
     for (mx, my) in click_marks:
         cv2.circle(frame, (mx, my + UI_TOP), SAMPLE_RADIUS, col, 2)
@@ -190,7 +234,6 @@ def draw_ui(frame: np.ndarray, click_marks: list) -> np.ndarray:
     return frame
 
 
-# Klick-Markierungen (display-Koordinaten, relativ zu Bildbereich unter UI)
 click_marks: list[tuple[int, int]] = []
 
 
@@ -198,14 +241,10 @@ def on_click(event, x, y, flags, param):
     global last_frame
     if event != cv2.EVENT_LBUTTONDOWN:
         return
-    if last_frame is None:
-        return
-    # Nur Klicks unterhalb des UI-Streifens
-    if y < UI_TOP:
+    if last_frame is None or y < UI_TOP:
         return
 
     fh, fw = last_frame.shape[:2]
-    # Bildbereich im Fenster: x von 0..DISPLAY_W, y von UI_TOP..DISPLAY_H
     img_display_h = DISPLAY_H - UI_TOP
     real_x = int(x / DISPLAY_W * fw)
     real_y = int((y - UI_TOP) / img_display_h * fh)
@@ -228,7 +267,7 @@ def on_click(event, x, y, flags, param):
 
 def print_config():
     print("\n" + "=" * 65)
-    print("Kalibrierte HSV-Werte — kopiere das in deine config.py:")
+    print("Kalibrierte HSV-Werte — kopiere das in deine DetectionConfig:")
     print("=" * 65)
     for name, (lo_key, hi_key) in CONFIG_KEYS.items():
         if name in ranges:
@@ -238,9 +277,12 @@ def print_config():
             print(f"  {hi_key}: list = field(default_factory=lambda: {hi})")
         else:
             print(f"\n  # {name}: nicht kalibriert (Standardwert bleibt)")
+    print("\n  # ROI-Werte")
+    print(f"  roi_top:    float = {roi['top']}")
+    print(f"  roi_bottom: float = {roi['bottom']}")
+    print(f"  roi_left:   float = {roi['left']}")
+    print(f"  roi_right:  float = {roi['right']}")
     print("\n" + "─" * 65)
-    print("Danach in config.py:")
-    print("  dummy_mode: bool = False")
     print("Dann: python main.py")
     print("=" * 65 + "\n")
 
@@ -255,13 +297,14 @@ def main():
 
     print("\nKalibrierungs-Tool gestartet.")
     print("Klicke 3–5x auf ein Objekt → HSV-Bereich wird automatisch berechnet.")
-    print("1=Ball  2=Boostpad  3=EigenTor  4=GegnerTor  5=GegnerAuto  r=Reset  q=Ende\n")
+    print("1=Ball  2=Boost  3=EigenTor  4=GegnerTor  5=GegnerAuto")
+    print("ROI: W/S = obere Grenze | I/K = untere Grenze | A/D = Seiten")
+    print("r=Reset  q=Ende\n")
 
     while True:
         raw = grab_frame()
         last_frame = raw.copy()
 
-        # Maske-Overlay wenn Range vorhanden
         if current_mode in ranges:
             lo, hi = ranges[current_mode]
             col    = MODE_COLORS_BGR.get(current_mode, (0, 255, 0))
@@ -269,19 +312,17 @@ def main():
         else:
             vis = raw.copy()
 
-        # Auf Display-Größe skalieren (nur Bildbereich)
         img_h = DISPLAY_H - UI_TOP
         vis_resized = cv2.resize(vis, (DISPLAY_W, img_h))
 
-        # Canvas: UI-Streifen + Bild
+        # ROI-Rahmen auf das skalierte Bild zeichnen
+        draw_roi_overlay(vis_resized)
+
         canvas = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
         canvas[UI_TOP:, :] = vis_resized
-
-        # UI + Klick-Markierungen drauf
         canvas = draw_ui(canvas, click_marks)
 
         cv2.imshow(WIN, canvas)
-
         key = cv2.waitKey(30) & 0xFF
 
         if key == ord("q"):
@@ -293,6 +334,20 @@ def main():
             if current_mode in ranges:
                 del ranges[current_mode]
             print(f"  [{current_mode}] zurückgesetzt.")
+
+        # ROI-Anpassung
+        if key == ord("w"):
+            roi["top"] = max(0.0, roi["top"] - ROI_STEP)
+        elif key == ord("s"):
+            roi["top"] = min(roi["bottom"] - 0.05, roi["top"] + ROI_STEP)
+        elif key == ord("i"):
+            roi["bottom"] = max(roi["top"] + 0.05, roi["bottom"] - ROI_STEP)
+        elif key == ord("k"):
+            roi["bottom"] = min(1.0, roi["bottom"] + ROI_STEP)
+        elif key == ord("a"):
+            roi["left"] = max(0.0, roi["left"] - ROI_STEP)
+        elif key == ord("d"):
+            roi["left"] = min(roi["right"] - 0.05, roi["left"] + ROI_STEP)
 
         new_mode = MODES.get(key)
         if new_mode and new_mode != current_mode:
