@@ -1,0 +1,457 @@
+"""
+detector.py — Robuste Objekterkennung mit Multi-Filter-Pipeline
+
+Nutzt die bestehende Config aus config.py (keine doppelten HSV-Werte).
+Wird von detection.py als bessere Erkennungs-Engine genutzt.
+
+Pipeline pro Objekt:
+  1. HSV-Farbfilter
+  2. Spielfeld-ROI  (UI oben/unten ausblenden)
+  3. Tracker-ROI    (nur um letzte bekannte Position suchen)
+  4. Form + Größe   (Kreisförmigkeit, Min/Max-Radius)
+  5. Konfidenz-Scoring → bestes Objekt
+"""
+
+from __future__ import annotations
+import cv2
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
+from config import Config, VisionConfig
+
+
+# ── Tracker-Objekt ────────────────────────────────────────────────────────────
+
+@dataclass
+class TrackedObject:
+    x:           int   = 0
+    y:           int   = 0
+    radius:      int   = 0
+    width:       int   = 0
+    height:      int   = 0
+    confidence:  float = 0.0
+    lost_frames: int   = 0
+    found:       bool  = False
+
+    # Normierte Koordinaten (0.0–1.0) — für GameState kompatibel
+    nx: float = -1.0
+    ny: float = -1.0
+
+    def normalize(self, frame_w: int, frame_h: int) -> None:
+        """Berechnet normierte Koordinaten aus Pixel-Koordinaten."""
+        if self.found and frame_w > 0 and frame_h > 0:
+            self.nx = self.x / frame_w
+            self.ny = self.y / frame_h
+
+
+# ── Tracker-Einstellungen (getrennt von HSV-Werten) ──────────────────────────
+
+@dataclass
+class TrackerConfig:
+    # ROI: Anteil des Bildes der als Spielfeld gilt
+    roi_top:    float = 0.12   # Obere 12% = UI (Timer, Score) ignorieren
+    roi_bottom: float = 0.92
+    roi_left:   float = 0.04
+    roi_right:  float = 0.96
+
+    # Ball
+    ball_min_radius:      int   = 5
+    ball_max_radius:      int   = 70
+    ball_circularity_min: float = 0.65
+
+    # Gegner-Auto (Rechteck-basiert, kein Kreis)
+    enemy_min_area:        int   = 150
+    enemy_max_area:        int   = 10000
+    enemy_aspect_ratio_lo: float = 0.4
+    enemy_aspect_ratio_hi: float = 3.0
+
+    # Boostpad
+    boost_min_radius: int   = 3
+    boost_max_radius: int   = 35
+    boost_circularity: float = 0.50
+
+    # Tracker-Verhalten
+    tracker_search_radius: int = 130   # Pixel-Suchradius um letzte Position
+    tracker_lost_frames:   int = 10    # Frames bis Tracker-Reset
+
+
+# ── Hilfsfunktionen ──────────────────────────────────────────────────────────
+
+def build_roi_mask(frame_shape: tuple, tcfg: TrackerConfig) -> np.ndarray:
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    y1, y2 = int(h * tcfg.roi_top),   int(h * tcfg.roi_bottom)
+    x1, x2 = int(w * tcfg.roi_left),  int(w * tcfg.roi_right)
+    mask[y1:y2, x1:x2] = 255
+    return mask
+
+
+def apply_tracker_roi(mask: np.ndarray, tracker: TrackedObject,
+                      tcfg: TrackerConfig) -> np.ndarray:
+    """Schränkt Suchbereich auf Radius um letzte bekannte Position ein."""
+    if not tracker.found or tracker.lost_frames >= tcfg.tracker_lost_frames:
+        return mask
+    h, w = mask.shape[:2]
+    tm = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(tm, (tracker.x, tracker.y), tcfg.tracker_search_radius, 255, -1)
+    return cv2.bitwise_and(mask, tm)
+
+
+def contour_circularity(contour) -> float:
+    area = cv2.contourArea(contour)
+    if area < 1:
+        return 0.0
+    p = cv2.arcLength(contour, True)
+    if p < 1:
+        return 0.0
+    return (4 * np.pi * area) / (p * p)
+
+
+def hsv_mask(frame_bgr: np.ndarray, lower: list, upper: list) -> np.ndarray:
+    hsv    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask   = cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+
+# ── Erkennungs-Funktionen ────────────────────────────────────────────────────
+
+def detect_ball(frame_bgr: np.ndarray,
+                vcfg: VisionConfig,
+                tcfg: TrackerConfig,
+                tracker: TrackedObject,
+                roi_mask: Optional[np.ndarray] = None) -> TrackedObject:
+    """
+    Ball-Erkennung mit 5-stufiger Pipeline.
+    Nutzt HSV-Werte aus VisionConfig (config.py).
+    """
+    h, w = frame_bgr.shape[:2]
+    mask = hsv_mask(frame_bgr, vcfg.ball_hsv_lower, vcfg.ball_hsv_upper)
+
+    if roi_mask is not None:
+        mask = cv2.bitwise_and(mask, roi_mask)
+    mask = apply_tracker_roi(mask, tracker, tcfg)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best       = TrackedObject()
+    best_score = -1.0
+
+    for c in contours:
+        if cv2.contourArea(c) < 10:
+            continue
+        (cx, cy), radius = cv2.minEnclosingCircle(c)
+        radius = int(radius)
+        if not (tcfg.ball_min_radius <= radius <= tcfg.ball_max_radius):
+            continue
+        circ = contour_circularity(c)
+        if circ < tcfg.ball_circularity_min:
+            continue
+        area  = cv2.contourArea(c)
+        score = circ * min(area / 400.0, 1.0)
+        if score > best_score:
+            best_score       = score
+            best.x           = int(cx)
+            best.y           = int(cy)
+            best.radius      = radius
+            best.confidence  = round(score, 3)
+            best.found       = True
+            best.lost_frames = 0
+
+    if not best.found:
+        tracker.lost_frames += 1
+        if tracker.lost_frames >= tcfg.tracker_lost_frames:
+            tracker.found = False
+        # Normieren mit alter Position
+        tracker.normalize(w, h)
+        return tracker
+
+    best.normalize(w, h)
+    return best
+
+
+def detect_enemy(frame_bgr: np.ndarray,
+                 vcfg: VisionConfig,
+                 tcfg: TrackerConfig,
+                 tracker: TrackedObject,
+                 roi_mask: Optional[np.ndarray] = None) -> TrackedObject:
+    """Gegner-Auto Erkennung (Rechteck-basiert)."""
+    h, w = frame_bgr.shape[:2]
+    mask = hsv_mask(frame_bgr, vcfg.enemy_hsv_lower, vcfg.enemy_hsv_upper)
+
+    if roi_mask is not None:
+        mask = cv2.bitwise_and(mask, roi_mask)
+    mask = apply_tracker_roi(mask, tracker, tcfg)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best       = TrackedObject()
+    best_score = -1.0
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if not (tcfg.enemy_min_area <= area <= tcfg.enemy_max_area):
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        aspect = bw / bh if bh > 0 else 0
+        if not (tcfg.enemy_aspect_ratio_lo <= aspect <= tcfg.enemy_aspect_ratio_hi):
+            continue
+        hull     = cv2.convexHull(c)
+        hull_area = cv2.contourArea(hull)
+        solidity  = area / hull_area if hull_area > 0 else 0.0
+        score     = solidity * min(area / tcfg.enemy_max_area, 1.0)
+        if score > best_score:
+            best_score       = score
+            best.x           = bx + bw // 2
+            best.y           = by + bh // 2
+            best.width       = bw
+            best.height      = bh
+            best.confidence  = round(score, 3)
+            best.found       = True
+            best.lost_frames = 0
+
+    if not best.found:
+        tracker.lost_frames += 1
+        if tracker.lost_frames >= tcfg.tracker_lost_frames:
+            tracker.found = False
+        tracker.normalize(w, h)
+        return tracker
+
+    best.normalize(w, h)
+    return best
+
+
+def detect_boost_pads(frame_bgr: np.ndarray,
+                      vcfg: VisionConfig,
+                      tcfg: TrackerConfig,
+                      roi_mask: Optional[np.ndarray] = None) -> list[TrackedObject]:
+    """Erkennt alle sichtbaren Boostpads, klassifiziert SMALL/LARGE per Radius."""
+    h, w   = frame_bgr.shape[:2]
+    img_area = float(h * w)
+    mask   = hsv_mask(frame_bgr, vcfg.boost_pad_hsv_lower, vcfg.boost_pad_hsv_upper)
+
+    if roi_mask is not None:
+        mask = cv2.bitwise_and(mask, roi_mask)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    results: list[TrackedObject] = []
+
+    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:vcfg.max_boost_pads]:
+        area = cv2.contourArea(c)
+        if area < 8:
+            continue
+        (cx, cy), radius = cv2.minEnclosingCircle(c)
+        radius = int(radius)
+        if not (tcfg.boost_min_radius <= radius <= tcfg.boost_max_radius):
+            continue
+        circ = contour_circularity(c)
+        if circ < tcfg.boost_circularity:
+            continue
+        obj            = TrackedObject()
+        obj.x          = int(cx)
+        obj.y          = int(cy)
+        obj.radius     = radius
+        obj.confidence = round(circ, 3)
+        obj.found      = True
+        # LARGE wenn normierte Fläche groß genug
+        obj.width      = 1 if (area / img_area) >= 0.003 else 0   # 1=LARGE, 0=SMALL
+        obj.normalize(w, h)
+        results.append(obj)
+
+    return results
+
+
+def detect_goals(frame_bgr: np.ndarray,
+                 vcfg: VisionConfig,
+                 roi_mask: Optional[np.ndarray] = None) -> dict[str, TrackedObject]:
+    """Erkennt eigenes und gegnerisches Tor."""
+    h, w = frame_bgr.shape[:2]
+    results: dict[str, TrackedObject] = {}
+
+    for key, lo, hi in [
+        ("own",   vcfg.goal_own_hsv_lower,   vcfg.goal_own_hsv_upper),
+        ("enemy", vcfg.goal_enemy_hsv_lower,  vcfg.goal_enemy_hsv_upper),
+    ]:
+        mask = hsv_mask(frame_bgr, lo, hi)
+        if roi_mask is not None:
+            mask = cv2.bitwise_and(mask, roi_mask)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        obj = TrackedObject()
+
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > 200:
+                bx, by, bw, bh = cv2.boundingRect(largest)
+                obj.x          = bx + bw // 2
+                obj.y          = by + bh // 2
+                obj.width      = bw
+                obj.height     = bh
+                obj.found      = True
+                obj.confidence = round(min(cv2.contourArea(largest) / 5000.0, 1.0), 3)
+                obj.normalize(w, h)
+
+        results[key] = obj
+
+    return results
+
+
+# ── Visualisierung ────────────────────────────────────────────────────────────
+
+COLORS = {
+    "ball":       (0,   255, 100),
+    "enemy":      (200,   0, 200),
+    "boost":      (0,   220, 220),
+    "goal_own":   (255, 100,   0),
+    "goal_enemy": (0,    50, 220),
+}
+
+
+def visualize(frame_bgr: np.ndarray, state: dict,
+              tcfg: Optional[TrackerConfig] = None) -> np.ndarray:
+    vis = frame_bgr.copy()
+
+    # ROI-Rahmen
+    if tcfg:
+        h, w = vis.shape[:2]
+        cv2.rectangle(vis,
+                      (int(w * tcfg.roi_left),  int(h * tcfg.roi_top)),
+                      (int(w * tcfg.roi_right), int(h * tcfg.roi_bottom)),
+                      (60, 60, 60), 1)
+
+    # Ball
+    b = state.get("ball")
+    if b and b.found:
+        cv2.circle(vis, (b.x, b.y), b.radius + 4, COLORS["ball"], 2)
+        cv2.circle(vis, (b.x, b.y), 3, (255, 255, 255), -1)
+        cv2.putText(vis, f"Ball {b.confidence:.2f} ({b.nx:.2f},{b.ny:.2f})",
+                    (b.x - 30, b.y - b.radius - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS["ball"], 1)
+
+    # Gegner
+    e = state.get("enemy")
+    if e and e.found:
+        x1 = e.x - e.width  // 2
+        y1 = e.y - e.height // 2
+        cv2.rectangle(vis, (x1, y1), (x1 + e.width, y1 + e.height), COLORS["enemy"], 2)
+        cv2.putText(vis, f"Gegner {e.confidence:.2f}",
+                    (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS["enemy"], 1)
+
+    # Boosts
+    for pad in state.get("boosts", []):
+        if not pad.found:
+            continue
+        lbl = "LARGE" if pad.width == 1 else "small"
+        cv2.circle(vis, (pad.x, pad.y), pad.radius + 3, COLORS["boost"], 2)
+        cv2.putText(vis, lbl, (pad.x - 16, pad.y - pad.radius - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, COLORS["boost"], 1)
+
+    # Tore
+    for key, col_key, label in [
+        ("own",   "goal_own",   "Eigenes Tor"),
+        ("enemy", "goal_enemy", "Gegner-Tor"),
+    ]:
+        g = state.get("goals", {}).get(key)
+        if g and g.found:
+            x1 = g.x - g.width  // 2
+            y1 = g.y - g.height // 2
+            cv2.rectangle(vis, (x1, y1), (x1 + g.width, y1 + g.height),
+                          COLORS[col_key], 2)
+            cv2.putText(vis, label, (x1, y1 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS[col_key], 1)
+
+    return vis
+
+
+# ── Haupt-Pipeline ────────────────────────────────────────────────────────────
+
+class GameDetector:
+    """
+    Zentrale Klasse — nutzt Config aus config.py für HSV-Werte.
+    TrackerConfig ist separat und steuert nur das Tracker-Verhalten.
+
+    Nutzung in detection.py:
+        from vision.detector import GameDetector, TrackerConfig
+        detector = GameDetector(config)
+        state    = detector.update(frame)
+        # state['ball'].nx / .ny = normierte Koordinaten für GameState
+    """
+
+    def __init__(self, config: Config, tracker_cfg: Optional[TrackerConfig] = None):
+        self.vcfg = config.vision
+        self.tcfg = tracker_cfg or TrackerConfig()
+        self._roi_mask: Optional[np.ndarray] = None
+        self.ball_tracker  = TrackedObject()
+        self.enemy_tracker = TrackedObject()
+
+    def _ensure_roi(self, frame: np.ndarray) -> None:
+        if self._roi_mask is None:
+            self._roi_mask = build_roi_mask(frame.shape, self.tcfg)
+
+    def update(self, frame_bgr: np.ndarray) -> dict:
+        self._ensure_roi(frame_bgr)
+        self.ball_tracker  = detect_ball(
+            frame_bgr, self.vcfg, self.tcfg, self.ball_tracker,  self._roi_mask)
+        self.enemy_tracker = detect_enemy(
+            frame_bgr, self.vcfg, self.tcfg, self.enemy_tracker, self._roi_mask)
+        boosts = detect_boost_pads(frame_bgr, self.vcfg, self.tcfg, self._roi_mask)
+        goals  = detect_goals(frame_bgr, self.vcfg, self._roi_mask)
+        return {
+            "ball":   self.ball_tracker,
+            "enemy":  self.enemy_tracker,
+            "boosts": boosts,
+            "goals":  goals,
+        }
+
+    def visualize(self, frame_bgr: np.ndarray, state: dict) -> np.ndarray:
+        return visualize(frame_bgr, state, self.tcfg)
+
+
+# ── Standalone-Test (python detector.py) ─────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, ".")          # damit config.py gefunden wird
+    from config import Config
+
+    try:
+        import mss
+        def grab():
+            with mss.mss() as sct:
+                mon = sct.monitors[1]
+                img = sct.grab(mon)
+                return np.array(img)[:, :, :3]
+    except ImportError:
+        from PIL import ImageGrab
+        def grab():
+            img = ImageGrab.grab()
+            return np.array(img)[:, :, ::-1]
+
+    cfg      = Config()
+    # dummy_mode MUSS False sein für echte Erkennung
+    cfg.vision.dummy_mode = False
+    detector = GameDetector(cfg)
+
+    print("Detektor-Test gestartet — q zum Beenden")
+    print("Stelle sicher dass Rocket League im Vordergrund läuft!\n")
+
+    while True:
+        frame = grab()
+        frame = cv2.resize(frame, (640, 360))
+        state = detector.update(frame)
+
+        b = state["ball"]
+        e = state["enemy"]
+        if b.found:
+            print(f"\rBall: ({b.x},{b.y}) r={b.radius} conf={b.confidence:.2f} "
+                  f"norm=({b.nx:.2f},{b.ny:.2f})  ", end="")
+        else:
+            print(f"\rBall: nicht gefunden (lost={b.lost_frames})          ", end="")
+
+        vis = detector.visualize(frame, state)
+        cv2.imshow("RL Detektor — q=Beenden", cv2.resize(vis, (1280, 720)))
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cv2.destroyAllWindows()
+    print("\nBeendet.")
