@@ -1,31 +1,22 @@
 """
-calibrate.py — HSV-Kalibrierungs-Tool für den Rocket League AI Bot
+calibrate.py — Klick-Kalibrierung für den Rocket League AI Bot
 
-Starte dieses Skript WÄHREND Rocket League im Fenster läuft:
-    python calibrate.py
-
-Steuerung:
-    1 = Ball-Maske anzeigen       (orange)
-    2 = Boostpad-Maske anzeigen   (gelb)
-    3 = Eigenes Tor               (blau)
-    4 = Gegnerisches Tor          (rot)
-    5 = Gegner-Autos              (lila)
-    6 = Hough-Kreise (Ball)
-    0 = Original-Frame
-    q = Beenden + Werte ausgeben
-
-Schieberegler:
-    H_lo / H_hi  = Farbton (0–179)
-    S_lo / S_hi  = Sättigung (0–255)
-    V_lo / V_hi  = Helligkeit (0–255)
-
-Wenn du eine gute Maske siehst (Ball leuchtet weiß, Rest schwarz)
-→ notiere die Werte und trage sie in config.py ein.
+Anleitung:
+  1. Rocket League im Fenster-Modus starten
+  2. python calibrate.py
+  3. Im Fenster auf das Objekt klicken das du kalibrieren willst
+  4. Mehrmals klicken für bessere Genauigkeit (sammelt Pixel)
+  5. Tasten zum Wechseln des Modus:
+       1 = Ball           2 = Boostpad (groß)
+       3 = Eigenes Tor    4 = Gegnerisches Tor
+       5 = Gegner-Auto    r = Reset aktueller Modus
+       s = Speichern      q = Beenden + config.py Werte ausgeben
 """
 
 import sys
 import cv2
 import numpy as np
+from collections import defaultdict
 
 try:
     import mss
@@ -43,26 +34,43 @@ if not _MSS and not _PIL:
     print("FEHLER: pip install mss  oder  pip install Pillow")
     sys.exit(1)
 
-# ── Standard-Startwerte (aus config.py) ──────────────────────────────────────
-PRESETS = {
-    "1_ball":        ([5,  150, 150], [20, 255, 255]),
-    "2_boost_pad":   ([20, 100, 150], [35, 255, 255]),
-    "3_own_goal":    ([100, 80,  80], [130, 255, 255]),
-    "4_enemy_goal":  ([0,   80,  80], [10,  255, 255]),
-    "5_enemy_car":   ([140, 80,  80], [170, 255, 255]),
+# ── Konfiguration ─────────────────────────────────────────────────────────────
+
+SAMPLE_RADIUS = 8      # Pixel-Radius um Klickpunkt
+HSV_MARGIN    = [8, 40, 40]   # [H, S, V] Spielraum um berechneten Bereich
+
+MODES = {
+    ord("1"): "Ball",
+    ord("2"): "Boostpad",
+    ord("3"): "Eigenes Tor",
+    ord("4"): "Gegnerisches Tor",
+    ord("5"): "Gegner-Auto",
 }
 
-MODE_NAMES = {
-    ord("1"): "1_ball",
-    ord("2"): "2_boost_pad",
-    ord("3"): "3_own_goal",
-    ord("4"): "4_enemy_goal",
-    ord("5"): "5_enemy_car",
-    ord("6"): "6_hough",
-    ord("0"): "0_original",
+MODE_COLORS_BGR = {
+    "Ball":             (0,   140, 255),
+    "Boostpad":         (0,   220, 220),
+    "Eigenes Tor":      (255, 100,   0),
+    "Gegnerisches Tor": (0,    50, 220),
+    "Gegner-Auto":      (200,   0, 200),
 }
 
-WINDOW = "RL Kalibrierung  |  1=Ball 2=Boost 3=EigenTor 4=GegnerTor 5=Gegner 6=Hough 0=Original q=Beenden"
+CONFIG_KEYS = {
+    "Ball":             ("ball_hsv_lower",       "ball_hsv_upper"),
+    "Boostpad":         ("boost_pad_hsv_lower",  "boost_pad_hsv_upper"),
+    "Eigenes Tor":      ("goal_own_hsv_lower",   "goal_own_hsv_upper"),
+    "Gegnerisches Tor": ("goal_enemy_hsv_lower", "goal_enemy_hsv_upper"),
+    "Gegner-Auto":      ("enemy_hsv_lower",      "enemy_hsv_upper"),
+}
+
+# ── Globaler State ────────────────────────────────────────────────────────────
+
+current_mode = "Ball"
+samples: dict[str, list] = defaultdict(list)
+ranges:  dict[str, tuple] = {}
+last_frame: np.ndarray | None = None
+DISPLAY_W, DISPLAY_H = 1280, 760
+UI_TOP = 90   # Höhe des oberen UI-Streifens in Pixeln
 
 
 def grab_frame() -> np.ndarray:
@@ -75,185 +83,228 @@ def grab_frame() -> np.ndarray:
     return np.array(img)[:, :, ::-1]
 
 
-def nothing(_): pass
+def sample_pixels_around(frame_bgr: np.ndarray, x: int, y: int) -> list:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    fh, fw = hsv.shape[:2]
+    pixels = []
+    for dy in range(-SAMPLE_RADIUS, SAMPLE_RADIUS + 1):
+        for dx in range(-SAMPLE_RADIUS, SAMPLE_RADIUS + 1):
+            if dx*dx + dy*dy > SAMPLE_RADIUS**2:
+                continue
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < fw and 0 <= ny < fh:
+                pixels.append(hsv[ny, nx].tolist())
+    return pixels
 
 
-def create_trackbars(win: str, lo: list, hi: list):
-    cv2.createTrackbar("H_lo", win, lo[0], 179, nothing)
-    cv2.createTrackbar("H_hi", win, hi[0], 179, nothing)
-    cv2.createTrackbar("S_lo", win, lo[1], 255, nothing)
-    cv2.createTrackbar("S_hi", win, hi[1], 255, nothing)
-    cv2.createTrackbar("V_lo", win, lo[2], 255, nothing)
-    cv2.createTrackbar("V_hi", win, hi[2], 255, nothing)
-
-
-def get_trackbar_vals(win: str) -> tuple[list, list]:
-    lo = [
-        cv2.getTrackbarPos("H_lo", win),
-        cv2.getTrackbarPos("S_lo", win),
-        cv2.getTrackbarPos("V_lo", win),
-    ]
-    hi = [
-        cv2.getTrackbarPos("H_hi", win),
-        cv2.getTrackbarPos("S_hi", win),
-        cv2.getTrackbarPos("V_hi", win),
-    ]
+def calc_range(pixel_list: list) -> tuple[list, list]:
+    arr = np.array(pixel_list, dtype=np.float32)
+    lo  = np.percentile(arr, 5,  axis=0).astype(int).tolist()
+    hi  = np.percentile(arr, 95, axis=0).astype(int).tolist()
+    lo  = [max(0,   lo[i] - HSV_MARGIN[i]) for i in range(3)]
+    hi  = [min(255 if i > 0 else 179, hi[i] + HSV_MARGIN[i]) for i in range(3)]
+    lo[0] = max(0,   lo[0])
+    hi[0] = min(179, hi[0])
     return lo, hi
 
 
-def set_trackbars(win: str, lo: list, hi: list):
-    cv2.setTrackbarPos("H_lo", win, lo[0])
-    cv2.setTrackbarPos("H_hi", win, hi[0])
-    cv2.setTrackbarPos("S_lo", win, lo[1])
-    cv2.setTrackbarPos("S_hi", win, hi[1])
-    cv2.setTrackbarPos("V_lo", win, lo[2])
-    cv2.setTrackbarPos("V_hi", win, hi[2])
-
-
-def apply_mask(frame_bgr: np.ndarray, lo: list, hi: list) -> np.ndarray:
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+def draw_mask_overlay(frame_bgr: np.ndarray, lo: list, hi: list,
+                      color_bgr: tuple) -> np.ndarray:
+    hsv    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask   = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.inRange(hsv, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    # Konturen zeichnen
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     result = frame_bgr.copy()
+    hl     = np.zeros_like(frame_bgr)
+    hl[mask > 0] = color_bgr
+    result = cv2.addWeighted(result, 0.55, hl, 0.45, 0)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for c in contours:
-        area = cv2.contourArea(c)
-        if area < 20:
+        if cv2.contourArea(c) < 15:
             continue
-        cv2.drawContours(result, [c], -1, (0, 255, 0), 2)
+        cv2.drawContours(result, [c], -1, color_bgr, 2)
         M = cv2.moments(c)
         if M["m00"] > 0:
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
-            cv2.circle(result, (cx, cy), 4, (0, 0, 255), -1)
-            cv2.putText(result, f"{area:.0f}px²", (cx + 5, cy - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-    # Maske als Overlay (links = Maske, rechts = Frame mit Konturen)
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    combined = np.hstack([
-        cv2.resize(mask_bgr, (640, 360)),
-        cv2.resize(result,   (640, 360)),
-    ])
-    return combined
+            cv2.circle(result, (cx, cy), 5, (255, 255, 255), -1)
+    return result
 
 
-def apply_hough(frame_bgr: np.ndarray) -> np.ndarray:
-    """Zeigt Hough-Kreise auf dem Frame."""
-    gray    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-    circles = cv2.HoughCircles(
-        blurred, cv2.HOUGH_GRADIENT,
-        dp=1.2, minDist=30,
-        param1=60, param2=30,
-        minRadius=4, maxRadius=60,
-    )
-    result = frame_bgr.copy()
-    if circles is not None:
-        for (x, y, r) in np.round(circles[0]).astype(int):
-            cv2.circle(result, (x, y), r,    (0, 255,   0), 2)
-            cv2.circle(result, (x, y), 2,    (0,   0, 255), 3)
-            cv2.putText(result, f"r={r}", (x + r + 3, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-    label = cv2.resize(result, (1280, 360))
-    return label
+def draw_ui(frame: np.ndarray, click_marks: list) -> np.ndarray:
+    h, w = frame.shape[:2]
+    # Oberer Streifen
+    cv2.rectangle(frame, (0, 0), (w, UI_TOP), (20, 20, 20), -1)
+    col = MODE_COLORS_BGR.get(current_mode, (255, 255, 255))
+    cv2.putText(frame, f"Modus: {current_mode}  — Klicke auf das Objekt",
+                (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, col, 2)
+    cv2.putText(frame,
+                "1=Ball  2=Boostpad  3=EigenTor  4=GegnerTor  5=GegnerAuto  "
+                "r=Reset  q=Beenden",
+                (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    cv2.putText(frame,
+                "Mehrmals klicken = genauer  |  Erkannte Bereiche leuchten farbig auf",
+                (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (130, 130, 130), 1)
+
+    # Rechtes Panel
+    px = w - 300
+    cv2.rectangle(frame, (px - 8, UI_TOP), (w, h), (12, 12, 12), -1)
+    y = UI_TOP + 22
+    cv2.putText(frame, "Status:", (px, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    y += 8
+    for name in CONFIG_KEYS:
+        y += 22
+        c = MODE_COLORS_BGR.get(name, (100, 100, 100))
+        if name in ranges:
+            lo, hi = ranges[name]
+            cv2.putText(frame, f"[OK] {name}", (px, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.47, c, 1)
+        else:
+            n = len(samples.get(name, []))
+            lbl = f"{n}px" if n else "—"
+            cv2.putText(frame, f"[ ] {name}  {lbl}", (px, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.47, (100, 100, 100), 1)
+
+    # Aktueller Bereich
+    if current_mode in ranges:
+        lo, hi = ranges[current_mode]
+        y += 28
+        cv2.putText(frame, f"lo={lo}", (px, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1)
+        y += 20
+        cv2.putText(frame, f"hi={hi}", (px, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1)
+        n_clicks = len(samples.get(current_mode, []))
+        y += 20
+        cv2.putText(frame, f"{n_clicks} Pixel gesammelt", (px, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
+
+    # Klick-Markierungen
+    col = MODE_COLORS_BGR.get(current_mode, (255, 255, 255))
+    for (mx, my) in click_marks:
+        cv2.circle(frame, (mx, my + UI_TOP), SAMPLE_RADIUS, col, 2)
+        cv2.circle(frame, (mx, my + UI_TOP), 2,             col, -1)
+
+    return frame
 
 
-def add_overlay(img: np.ndarray, mode_name: str, lo: list, hi: list) -> np.ndarray:
-    out = img.copy()
-    cv2.putText(out, f"Modus: {mode_name}", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(out, f"HSV_lo={lo}  HSV_hi={hi}", (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-    cv2.putText(out, "Gruen=erkannte Objekte | Links=Maske | Rechts=Frame", (10, 75),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-    return out
+# Klick-Markierungen (display-Koordinaten, relativ zu Bildbereich unter UI)
+click_marks: list[tuple[int, int]] = []
 
 
-def print_config(results: dict):
-    print("\n" + "=" * 60)
-    print("Kalibrierte HSV-Werte — in config.py eintragen:")
-    print("=" * 60)
-    mapping = {
-        "1_ball":       ("ball_hsv_lower",       "ball_hsv_upper"),
-        "2_boost_pad":  ("boost_pad_hsv_lower",  "boost_pad_hsv_upper"),
-        "3_own_goal":   ("goal_own_hsv_lower",   "goal_own_hsv_upper"),
-        "4_enemy_goal": ("goal_enemy_hsv_lower", "goal_enemy_hsv_upper"),
-        "5_enemy_car":  ("enemy_hsv_lower",      "enemy_hsv_upper"),
-    }
-    for key, (lo_name, hi_name) in mapping.items():
-        if key in results:
-            lo, hi = results[key]
-            print(f"  {lo_name}: list = field(default_factory=lambda: {lo})")
-            print(f"  {hi_name}: list = field(default_factory=lambda: {hi})")
-    print("=" * 60)
-    print("\nDanach in config.py: dummy_mode = False")
-    print("Dann: python main.py\n")
+def on_click(event, x, y, flags, param):
+    global last_frame
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    if last_frame is None:
+        return
+    # Nur Klicks unterhalb des UI-Streifens
+    if y < UI_TOP:
+        return
+
+    fh, fw = last_frame.shape[:2]
+    # Bildbereich im Fenster: x von 0..DISPLAY_W, y von UI_TOP..DISPLAY_H
+    img_display_h = DISPLAY_H - UI_TOP
+    real_x = int(x / DISPLAY_W * fw)
+    real_y = int((y - UI_TOP) / img_display_h * fh)
+    real_x = max(0, min(fw - 1, real_x))
+    real_y = max(0, min(fh - 1, real_y))
+
+    new_pixels = sample_pixels_around(last_frame, real_x, real_y)
+    samples[current_mode].extend(new_pixels)
+    click_marks.append((x, y - UI_TOP))
+
+    if len(samples[current_mode]) >= 10:
+        lo, hi = calc_range(samples[current_mode])
+        ranges[current_mode] = (lo, hi)
+        n = len(samples[current_mode])
+        print(f"  [{current_mode}] ({real_x},{real_y}) → lo={lo}  hi={hi}  [{n} Pixel]")
+    else:
+        left = 10 - len(samples[current_mode])
+        print(f"  [{current_mode}] ({real_x},{real_y}) — noch {left} Pixel bis erste Berechnung")
+
+
+def print_config():
+    print("\n" + "=" * 65)
+    print("Kalibrierte HSV-Werte — kopiere das in deine config.py:")
+    print("=" * 65)
+    for name, (lo_key, hi_key) in CONFIG_KEYS.items():
+        if name in ranges:
+            lo, hi = ranges[name]
+            print(f"\n  # {name}")
+            print(f"  {lo_key}: list = field(default_factory=lambda: {lo})")
+            print(f"  {hi_key}: list = field(default_factory=lambda: {hi})")
+        else:
+            print(f"\n  # {name}: nicht kalibriert (Standardwert bleibt)")
+    print("\n" + "─" * 65)
+    print("Danach in config.py:")
+    print("  dummy_mode: bool = False")
+    print("Dann: python main.py")
+    print("=" * 65 + "\n")
 
 
 def main():
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW, 1280, 500)
+    global current_mode, last_frame, click_marks
 
-    # Starte mit Ball-Preset
-    current_mode = "1_ball"
-    lo, hi = PRESETS[current_mode]
-    create_trackbars(WINDOW, lo, hi)
+    WIN = "RL Kalibrierung — Klicke auf Objekte"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, DISPLAY_W, DISPLAY_H)
+    cv2.setMouseCallback(WIN, on_click)
 
-    saved: dict = {}
     print("\nKalibrierungs-Tool gestartet.")
-    print("Drücke 1–6 um Modus zu wechseln, q zum Beenden.\n")
+    print("Klicke 3–5x auf ein Objekt → HSV-Bereich wird automatisch berechnet.")
+    print("1=Ball  2=Boostpad  3=EigenTor  4=GegnerTor  5=GegnerAuto  r=Reset  q=Ende\n")
 
     while True:
-        frame = grab_frame()
-        frame = cv2.resize(frame, (1280, 720))
+        raw = grab_frame()
+        last_frame = raw.copy()
 
-        lo, hi = get_trackbar_vals(WINDOW)
-
-        if current_mode == "0_original":
-            display = cv2.resize(frame, (1280, 360))
-        elif current_mode == "6_hough":
-            display = apply_hough(cv2.resize(frame, (640, 360)))
+        # Maske-Overlay wenn Range vorhanden
+        if current_mode in ranges:
+            lo, hi = ranges[current_mode]
+            col    = MODE_COLORS_BGR.get(current_mode, (0, 255, 0))
+            vis    = draw_mask_overlay(raw, lo, hi, col)
         else:
-            display = apply_mask(cv2.resize(frame, (640, 360)), lo, hi)
+            vis = raw.copy()
 
-        display = add_overlay(display, current_mode, lo, hi)
-        cv2.imshow(WINDOW, display)
+        # Auf Display-Größe skalieren (nur Bildbereich)
+        img_h = DISPLAY_H - UI_TOP
+        vis_resized = cv2.resize(vis, (DISPLAY_W, img_h))
+
+        # Canvas: UI-Streifen + Bild
+        canvas = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
+        canvas[UI_TOP:, :] = vis_resized
+
+        # UI + Klick-Markierungen drauf
+        canvas = draw_ui(canvas, click_marks)
+
+        cv2.imshow(WIN, canvas)
 
         key = cv2.waitKey(30) & 0xFF
 
         if key == ord("q"):
-            # Aktuellen Modus speichern
-            if current_mode not in ("0_original", "6_hough"):
-                saved[current_mode] = (lo[:], hi[:])
             break
 
-        if key == ord("s"):
-            # Aktuellen Modus manuell speichern
-            if current_mode not in ("0_original", "6_hough"):
-                saved[current_mode] = (lo[:], hi[:])
-                print(f"  Gespeichert: {current_mode} → lo={lo} hi={hi}")
+        if key == ord("r"):
+            samples[current_mode].clear()
+            click_marks.clear()
+            if current_mode in ranges:
+                del ranges[current_mode]
+            print(f"  [{current_mode}] zurückgesetzt.")
 
-        new_mode = MODE_NAMES.get(key)
+        new_mode = MODES.get(key)
         if new_mode and new_mode != current_mode:
-            # Alten Modus speichern
-            if current_mode not in ("0_original", "6_hough"):
-                saved[current_mode] = (lo[:], hi[:])
-                print(f"  Gespeichert: {current_mode} → lo={lo} hi={hi}")
-            # Neuen Modus laden
             current_mode = new_mode
-            if new_mode in PRESETS:
-                lo, hi = PRESETS[new_mode]
-                set_trackbars(WINDOW, lo, hi)
-            print(f"  Modus gewechselt: {new_mode}")
+            click_marks.clear()
+            print(f"\n  Modus: {current_mode}  — jetzt auf {current_mode} klicken")
 
     cv2.destroyAllWindows()
-    if saved:
-        print_config(saved)
+    if ranges:
+        print_config()
     else:
-        print("Keine Werte gespeichert (s=speichern, dann q=beenden).")
+        print("Keine Werte kalibriert.")
 
 
 if __name__ == "__main__":
