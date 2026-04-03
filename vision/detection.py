@@ -1,26 +1,21 @@
 from __future__ import annotations
+import cv2
 import numpy as np
 from config import Config
 from core.state import GameState, ObjectPosition, BoostPadType
 from vision.preprocessing import to_gray, crop_region
 from vision.detector import GameDetector, TrackerConfig, TrackedObject
+from vision.player_tracker import PlayerTracker
 
-
-_SHOT_BALL_DIST  = 0.25
-_SHOT_ALIGN_DIST = 0.20
+_SHOT_BALL_DIST = 0.25
 
 
 class Detector:
-    """
-    Haupt-Detektor für den Game-Loop.
-    Delegiert die eigentliche Bild-Erkennung an GameDetector (detector.py),
-    übersetzt dessen TrackedObject-Ergebnisse in GameState-Objekte.
-    """
-
     def __init__(self, config: Config):
-        self._cfg      = config.vision
-        self._gameplay = config.gameplay
-        self._game_det = GameDetector(config, TrackerConfig())
+        self._cfg         = config.vision
+        self._gameplay    = config.gameplay
+        self._game_det    = GameDetector(config, TrackerConfig())
+        self._player_trk  = PlayerTracker()
 
     def detect(self, processed: np.ndarray, raw: np.ndarray) -> GameState:
         if self._cfg.dummy_mode:
@@ -31,20 +26,25 @@ class Detector:
         det   = self._game_det.update(processed)
         boost = self._read_boost(processed)
 
-        ball  = det["ball"]
-        enemy = det["enemy"]
-        goals = det["goals"]
-        pads  = det["boosts"]
-
+        ball        = det["ball"]
+        enemy       = det["enemy"]
+        goals       = det["goals"]
+        pads        = det["boosts"]
         ball_visible = ball.found
         ball_x       = ball.nx if ball.found else -1.0
         ball_y       = ball.ny if ball.found else -1.0
         ball_radius  = ball.radius / max(processed.shape[1], processed.shape[0])
 
+        # ── Spielerposition via optischem Fluss ──────────────────────────────
+        gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+        player_x, player_y = self._player_trk.update(
+            gray, ball_x, ball_y, ball_visible
+        )
+
         own_goal   = self._tracked_to_pos(goals.get("own"),   0.5, 1.0)
         enemy_goal = self._tracked_to_pos(goals.get("enemy"), 0.5, 0.0)
 
-        enemies = []
+        enemies: list[ObjectPosition] = []
         if enemy.found:
             enemies.append(ObjectPosition(enemy.nx, enemy.ny, True))
 
@@ -53,23 +53,25 @@ class Detector:
             pad_type = BoostPadType.LARGE if p.width == 1 else BoostPadType.SMALL
             boost_pads.append(ObjectPosition(p.nx, p.ny, True, pad_type=pad_type))
 
-        nearest_boost       = self._nearest_pad(boost_pads, 0.5, 0.5)
+        nearest_boost       = self._nearest_pad(boost_pads, player_x, player_y)
         nearest_large_boost = self._nearest_pad(
-            [p for p in boost_pads if p.pad_type == BoostPadType.LARGE], 0.5, 0.5
+            [p for p in boost_pads if p.pad_type == BoostPadType.LARGE],
+            player_x, player_y,
         )
 
         phase = self._determine_phase(ball_visible, ball_y, boost)
 
         state = GameState(
-            ball_x=ball_x,            ball_y=ball_y,
-            ball_visible=ball_visible, ball_radius=ball_radius,
-            boost=boost,              phase=phase,
-            own_goal=own_goal,        enemy_goal=enemy_goal,
-            enemies=enemies,          teammates=[],
+            ball_x=ball_x,             ball_y=ball_y,
+            ball_visible=ball_visible,  ball_radius=ball_radius,
+            player_x=player_x,         player_y=player_y,
+            boost=boost,               phase=phase,
+            own_goal=own_goal,         enemy_goal=enemy_goal,
+            enemies=enemies,           teammates=[],
             boost_pads=boost_pads,
             nearest_boost=nearest_boost,
             nearest_large_boost=nearest_large_boost,
-            frame_raw=raw,            frame_processed=processed,
+            frame_raw=raw,             frame_processed=processed,
         )
         state.shot_opportunity, state.ball_to_goal_angle = \
             self._calc_shot_opportunity(state)
@@ -92,8 +94,9 @@ class Detector:
             [p for p in dummy_pads if p.pad_type == BoostPadType.LARGE], 0.5, 0.5
         )
         state = GameState(
-            ball_x=cfg.dummy_ball_x, ball_y=cfg.dummy_ball_y,
-            ball_visible=True,       ball_radius=0.04,
+            ball_x=cfg.dummy_ball_x,  ball_y=cfg.dummy_ball_y,
+            ball_visible=True,        ball_radius=0.04,
+            player_x=0.5,            player_y=0.7,
             boost=boost,             phase=phase,
             own_goal=ObjectPosition(0.5, 1.0, True),
             enemy_goal=ObjectPosition(0.5, 0.0, True),
@@ -117,11 +120,10 @@ class Detector:
         dist = (dx*dx + dy*dy) ** 0.5
         if dist < 0.01:
             return True, 0.0
-        angle      = abs(dx) / (abs(dx) + abs(dy) + 1e-6)
-        ball_near  = state.ball_dist_to_player < _SHOT_BALL_DIST
-        behind     = state.player_y > state.ball_y + 0.05
-        good_angle = angle < 0.5
-        return ball_near and behind and good_angle, angle
+        angle     = abs(dx) / (abs(dx) + abs(dy) + 1e-6)
+        ball_near = state.ball_dist_to_player < _SHOT_BALL_DIST
+        behind    = state.player_y > state.ball_y + 0.05
+        return ball_near and behind and angle < 0.5, angle
 
     @staticmethod
     def _tracked_to_pos(obj, default_x: float, default_y: float) -> ObjectPosition:
