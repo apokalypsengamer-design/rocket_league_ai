@@ -1,0 +1,197 @@
+"""
+player_tracker.py — Spielerposition schätzen ohne Minimap
+
+Liegt in: vision/player_tracker.py
+
+Strategie (kombiniert):
+  1. Optischer Fluss (Lucas-Kanade) → Bewegungsrichtung der Kamera
+  2. Ball-Kamera-Relation → grobe Feldposition rückrechnen
+  3. Exponentieller Glättungsfilter → Position stabilisieren
+
+Die geschätzte Position ist RELATIV zum Spielfeld (0.0–1.0).
+  x=0.0 = ganz links, x=1.0 = ganz rechts
+  y=0.0 = gegnerisches Tor, y=1.0 = eigenes Tor
+"""
+
+from __future__ import annotations
+import cv2
+import numpy as np
+
+
+# Spielfeld-ROI für optischen Fluss — UI oben/unten ignorieren
+_OF_ROI_TOP    = 0.15
+_OF_ROI_BOTTOM = 0.85
+_OF_ROI_LEFT   = 0.10
+_OF_ROI_RIGHT  = 0.90
+
+# Glättungsfaktor: 0.0 = nie updaten, 1.0 = kein Glätten
+_SMOOTH_X = 0.12
+_SMOOTH_Y = 0.10
+
+# Wie stark der optische Fluss die Position beeinflusst
+_FLOW_SENSITIVITY_X = 1.8
+_FLOW_SENSITIVITY_Y = 1.4
+
+# Lucas-Kanade Parameter
+_LK_PARAMS = dict(
+    winSize   = (15, 15),
+    maxLevel  = 2,
+    criteria  = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+)
+_FEATURE_PARAMS = dict(
+    maxCorners   = 80,
+    qualityLevel = 0.2,
+    minDistance  = 10,
+    blockSize    = 7,
+)
+
+# Wie viele Frames bis neue Feature-Punkte gesucht werden
+_REDETECT_INTERVAL = 20
+
+
+class PlayerTracker:
+    """
+    Schätzt die normierte Spielerposition (px, py) im Spielfeld.
+
+    Nutzung:
+        tracker = PlayerTracker()
+        # In jedem Frame:
+        px, py = tracker.update(gray_frame, ball_x, ball_y, ball_visible)
+        state.player_x = px
+        state.player_y = py
+    """
+
+    def __init__(self):
+        self._px: float = 0.5   # geschätzte X-Position
+        self._py: float = 0.7   # geschätzte Y-Position (etwas in eigener Hälfte starten)
+
+        self._prev_gray:  np.ndarray | None = None
+        self._prev_pts:   np.ndarray | None = None
+        self._frame_count: int = 0
+
+        # Kumulierter Fluss (integrierte Bewegung)
+        self._cum_flow_x: float = 0.0
+        self._cum_flow_y: float = 0.0
+
+        # Letzter bekannter Ball für Positions-Anker
+        self._last_ball_x: float = 0.5
+        self._last_ball_y: float = 0.5
+
+    def update(self, gray: np.ndarray,
+               ball_x: float, ball_y: float,
+               ball_visible: bool) -> tuple[float, float]:
+        """
+        Gibt (player_x, player_y) zurück, beide normiert 0.0–1.0.
+        gray = Graustufen-Frame (bereits auf Zielgröße skaliert)
+        """
+        self._frame_count += 1
+        h, w = gray.shape[:2]
+
+        # Spielfeld-Ausschnitt für optischen Fluss
+        y1 = int(h * _OF_ROI_TOP)
+        y2 = int(h * _OF_ROI_BOTTOM)
+        x1 = int(w * _OF_ROI_LEFT)
+        x2 = int(w * _OF_ROI_RIGHT)
+        roi = gray[y1:y2, x1:x2]
+
+        flow_dx, flow_dy = self._compute_flow(roi)
+
+        # Kumulierten Fluss aktualisieren
+        # Kamera bewegt sich nach rechts → Spieler bewegt sich nach rechts
+        # (Fluss ist negativ wenn Bild nach links wandert = Spieler nach rechts)
+        self._cum_flow_x -= flow_dx * _FLOW_SENSITIVITY_X / w
+        self._cum_flow_y -= flow_dy * _FLOW_SENSITIVITY_Y / h
+
+        # Ball-Anker: wenn Ball sichtbar, korrigieren wir die Position
+        # Logik: Die Kamera zeigt immer ca. zwischen Spieler und Ball.
+        # Ball bei x=0.3 im Frame bedeutet: Ball ist links von Spieler.
+        # Ball bei x=0.7 im Frame bedeutet: Ball ist rechts von Spieler.
+        if ball_visible:
+            # Ball-Mitte im Frame = 0.5. Abweichung = Ball ist links/rechts von uns.
+            ball_offset_x = ball_x - 0.5   # negativ = Ball links = Spieler rechts
+            ball_offset_y = ball_y - 0.5
+
+            # Sanfte Korrektur zur geschätzten Position
+            # Wenn Ball links (offset negativ) → Spieler tendenziell rechts
+            anchor_x = 0.5 - ball_offset_x * 0.4
+            anchor_y = 0.5 + ball_offset_y * 0.3
+
+            # Anchor-Korrektur mit kleinem Gewicht einmischen
+            self._cum_flow_x = self._cum_flow_x * 0.95 + anchor_x * 0.05
+            self._cum_flow_y = self._cum_flow_y * 0.95 + anchor_y * 0.05
+
+            self._last_ball_x = ball_x
+            self._last_ball_y = ball_y
+
+        # Clamp auf Spielfeld
+        raw_x = max(0.05, min(0.95, self._cum_flow_x))
+        raw_y = max(0.05, min(0.95, self._cum_flow_y))
+
+        # Exponentielles Glätten
+        self._px = self._px * (1 - _SMOOTH_X) + raw_x * _SMOOTH_X
+        self._py = self._py * (1 - _SMOOTH_Y) + raw_y * _SMOOTH_Y
+
+        return round(self._px, 3), round(self._py, 3)
+
+    def _compute_flow(self, roi: np.ndarray) -> tuple[float, float]:
+        """
+        Berechnet mittleren optischen Fluss im ROI.
+        Gibt (dx, dy) in Pixeln zurück.
+        Wenn kein Fluss berechenbar: (0.0, 0.0)
+        """
+        if self._prev_gray is None or self._frame_count % _REDETECT_INTERVAL == 1:
+            self._prev_pts = cv2.goodFeaturesToTrack(roi, mask=None, **_FEATURE_PARAMS)
+            self._prev_gray = roi.copy()
+            return 0.0, 0.0
+
+        if self._prev_pts is None or len(self._prev_pts) < 4:
+            self._prev_pts = cv2.goodFeaturesToTrack(roi, mask=None, **_FEATURE_PARAMS)
+            self._prev_gray = roi.copy()
+            return 0.0, 0.0
+
+        # Nur wenn ROI-Größe gleich geblieben ist
+        if roi.shape != self._prev_gray.shape:
+            self._prev_gray = roi.copy()
+            self._prev_pts  = None
+            return 0.0, 0.0
+
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._prev_gray, roi, self._prev_pts, None, **_LK_PARAMS
+        )
+
+        if next_pts is None or status is None:
+            self._prev_gray = roi.copy()
+            self._prev_pts  = None
+            return 0.0, 0.0
+
+        good_old = self._prev_pts[status.flatten() == 1]
+        good_new = next_pts[status.flatten() == 1]
+
+        if len(good_old) < 3:
+            self._prev_gray = roi.copy()
+            self._prev_pts  = None
+            return 0.0, 0.0
+
+        flow = good_new - good_old
+        # Median statt Mittelwert: robuster gegen Ausreißer (Ball-Bewegung etc.)
+        dx = float(np.median(flow[:, 0]))
+        dy = float(np.median(flow[:, 1]))
+
+        self._prev_gray = roi.copy()
+        self._prev_pts  = good_new.reshape(-1, 1, 2)
+
+        # Sanity-Check: zu großer Sprung = wahrscheinlich Fehler
+        if abs(dx) > 30 or abs(dy) > 30:
+            return 0.0, 0.0
+
+        return dx, dy
+
+    def reset(self) -> None:
+        """Aufrufen bei Spielstart / nach Tor."""
+        self._px = 0.5
+        self._py = 0.7
+        self._cum_flow_x = 0.5
+        self._cum_flow_y = 0.7
+        self._prev_gray  = None
+        self._prev_pts   = None
+        self._frame_count = 0
