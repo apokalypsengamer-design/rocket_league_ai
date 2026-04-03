@@ -164,8 +164,8 @@ class PlayerTracker:
             self._prev_pts  = None
             return 0.0, 0.0
 
-        good_old = self._prev_pts[status.flatten() == 1]
-        good_new = next_pts[status.flatten() == 1]
+        good_old = self._prev_pts[status.flatten() == 1].reshape(-1, 2)
+        good_new = next_pts[status.flatten() == 1].reshape(-1, 2)
 
         if len(good_old) < 3:
             self._prev_gray = roi.copy()
